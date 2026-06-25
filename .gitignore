@@ -1,0 +1,24 @@
+# Dependencies
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Data
+data/
+*.db
+
+# Environment
+.env
+
+# Research/planning files (not code)
+engineering_memory.md
+IMPLEMENTATION.md
+IDEA.md
+RESEARCH.md
+OSS_RESEARCH.md
+
+# OS
+.DS_Store
+Thumbs.db
