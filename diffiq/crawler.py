@@ -1,99 +1,78 @@
-"""BSE filing manifest crawler.
+"""BSE corporate announcements crawler.
 
-Fetches the list of corporate filings for a stock from BSE's public API.
-BSE does not require authentication.
+Uses the `bse` Python package (https://pypi.org/project/bse/) which wraps
+the undocumented BSE API with proper session handling and throttling.
 """
 
 import logging
-from datetime import datetime
 from typing import Any
 
-import httpx
+from bse import BSE
 
-from diffiq.config import BSE_BASE_URL, BSE_PDF_URL
+from diffiq.config import BSE_PDF_BASE
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT: str = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
 
-HEADERS: dict[str, str] = {
-    "User-Agent": USER_AGENT,
-    "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.bseindia.com/corporates/ann.html",
-}
+def _build_pdf_url(attachment_name: str) -> str:
+    """Build full PDF URL from BSE attachment filename."""
+    if not attachment_name:
+        return ""
+    return f"{BSE_PDF_BASE}/{attachment_name.lstrip('/')}"
 
 
 def fetch_manifest(bse_code: str) -> list[dict[str, Any]]:
-    """Fetch filing manifest from BSE for a stock.
-
-    Hits the BSE CorpFilings API endpoint which returns corporate
-    announcements for the given scrip code.
+    """Fetch corporate announcements for a BSE scrip code.
 
     Args:
-        bse_code: BSE scrip code (e.g. '531456' for VEDL).
+        bse_code: BSE scrip code (e.g. '500295' for VEDL).
 
     Returns:
-        List of filing dicts with keys:
-            filing_uuid: unique identifier from the PDF filename.
-            subject:     filing description/title.
+        List of announcement dicts with keys:
+            filing_uuid: unique BSE filing UUID (NEWSID).
+            subject:     announcement headline/description.
             filing_date: date string in YYYY-MM-DD format.
-            pdf_url:     full URL to download the PDF.
-        Returns empty list on any failure (network, parse, etc.).
+            pdf_url:     full URL to download the PDF (or empty string).
+            filing_type: category name from BSE.
+        Returns empty list on any failure.
     """
-    url = f"{BSE_BASE_URL}/CorpFilings/w"
-    params = {"scripcode": bse_code, "fromdate": "", "todate": ""}
-
     try:
-        with httpx.Client(timeout=30.0) as client:
-            resp = client.get(url, params=params, headers=HEADERS)
-            resp.raise_for_status()
-            data: list[dict] = resp.json()
-    except httpx.HTTPError as e:
-        logger.warning("BSE API error for %s: %s", bse_code, e)
+        with BSE(download_folder="./") as b:
+            data = b.announcements(scripcode=bse_code, page_no=1)
+    except (ConnectionError, TimeoutError, ValueError) as e:
+        logger.warning("BSE API error for code %s: %s", bse_code, e)
         return []
-    except (ValueError, TypeError) as e:
-        logger.warning("BSE API parse error for %s: %s", bse_code, e)
+
+    table: list[dict] = data.get("Table", [])
+    if not table:
+        logger.info("No announcements for BSE code %s", bse_code)
         return []
 
     filings: list[dict[str, Any]] = []
-    for entry in data if isinstance(data, list) else []:
-        attchmnt: str | None = entry.get("attchmntFile") or entry.get("ATTACHMENT")
-        if not attchmnt:
+    for entry in table:
+        news_id: str = (entry.get("NEWSID") or "").strip()
+        if not news_id:
             continue
 
-        # Parse date — BSE format is DD/MM/YYYY
-        raw_date: str = entry.get("dt") or entry.get("DATE") or ""
-        parsed_date = _parse_bse_date(raw_date)
+        # BSE returns ISO datetime like "2026-06-25T11:02:46.533"
+        dt_raw: str = (entry.get("DT_TM") or entry.get("NEWS_DT") or "")[:10]
+        filing_date: str = dt_raw  # Already YYYY-MM-DD in ISO format
 
-        filing_uuid: str = attchmnt.replace(".pdf", "").strip()
+        attachment: str = (entry.get("ATTACHMENTNAME") or "").strip()
+        subject: str = (entry.get("NEWSSUB") or "").strip()
+        category: str = (entry.get("CATEGORYNAME") or "").strip()
 
         filings.append({
-            "filing_uuid": filing_uuid,
-            "subject": (entry.get("desc") or entry.get("DESCRIPTION") or "").strip(),
-            "filing_date": parsed_date,
-            "pdf_url": f"{BSE_PDF_URL}/{attchmnt}",
+            "filing_uuid": news_id,
+            "subject": subject,
+            "filing_date": filing_date,
+            "pdf_url": _build_pdf_url(attachment) if attachment else "",
+            "filing_type": category,
         })
 
     logger.info(
-        "Fetched %d filings for BSE code %s", len(filings), bse_code
+        "Fetched %d announcements for BSE code %s",
+        len(filings),
+        bse_code,
     )
     return filings
-
-
-def _parse_bse_date(raw_date: str) -> str:
-    """Convert BSE date format (DD/MM/YYYY) to YYYY-MM-DD.
-
-    Returns empty string if parsing fails.
-    """
-    if not raw_date:
-        return ""
-    try:
-        return datetime.strptime(raw_date.strip(), "%d/%m/%Y").strftime("%Y-%m-%d")
-    except (ValueError, TypeError):
-        logger.debug("Unparseable BSE date: %s", raw_date)
-        return ""

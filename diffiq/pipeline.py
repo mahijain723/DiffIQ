@@ -1,13 +1,21 @@
 """P0 pipeline — crawl BSE, download PDFs, extract text, store in SQLite."""
 
 import hashlib
+import io
 import logging
 from pathlib import Path
+from time import sleep
 
 import httpx
 import pypdf
 
-from diffiq.config import STOCKS, DB_PATH, PDF_CACHE_DIR, PDF_DOWNLOAD_TIMEOUT
+from diffiq.config import (
+    STOCKS,
+    DB_PATH,
+    PDF_CACHE_DIR,
+    PDF_DOWNLOAD_TIMEOUT,
+    CRAWL_DELAY_SECONDS,
+)
 from diffiq.crawler import fetch_manifest
 from diffiq.db import (
     get_filing_by_uuid,
@@ -15,6 +23,7 @@ from diffiq.db import (
     insert_filing,
     update_filing_raw_text,
     update_filing_status,
+    update_filing_type,
     upsert_stock,
 )
 from diffiq.schema import init_db
@@ -50,7 +59,7 @@ def download_and_extract(pdf_url: str) -> str | None:
         return None
 
     try:
-        reader = pypdf.PdfReader(resp.content)
+        reader = pypdf.PdfReader(io.BytesIO(resp.content))
         pages: list[str] = []
         for page in reader.pages:
             text = page.extract_text()
@@ -63,19 +72,22 @@ def download_and_extract(pdf_url: str) -> str | None:
     full_text: str = "\n".join(pages)
 
     if len(full_text) < 100:
-        logger.info("Extracted text too short (%d chars) — likely scanned PDF", len(full_text))
+        logger.info(
+            "Extracted text too short (%d chars) — likely scanned PDF",
+            len(full_text),
+        )
         return None
 
     return full_text
 
 
 def run_daily_pipeline() -> None:
-    """P0 daily pipeline: crawl, download, extract, store.
+    """P0 daily pipeline: crawl BSE announcements, download PDFs, extract, store.
 
     For each stock in the watchlist:
-        1. Fetch filing manifest from BSE.
-        2. Insert new filings (QUEUED status).
-        3. Download and extract text from QUEUED filings.
+        1. Fetch announcements from BSE corporate announcements API.
+        2. Insert new announcements (QUEUED status).
+        3. Download and extract text from filings with PDF URLs.
         4. Update status to READY or ERROR_*.
     """
     logger.info("=== DiffIQ P0 Pipeline Start ===")
@@ -89,17 +101,26 @@ def run_daily_pipeline() -> None:
     total_errors: int = 0
 
     for stock in STOCKS:
-        bse_code: str = stock["bse_code"]
+        bse_code: str = stock.get("bse_code") or ""
+        if not bse_code:
+            logger.info(
+                "Skipping %s (no BSE code — ETF/cash equivalent)",
+                stock["name"],
+            )
+            continue
+
+        symbol: str = stock["symbol"]
         name: str = stock["name"]
 
-        # Ensure stock is in DB
+        # Ensure stock is in DB (use BSE code as unique identifier)
         stock_id: int = upsert_stock(conn, bse_code, name)
-        logger.info("Processing %s (BSE: %s, id=%d)", name, bse_code, stock_id)
+        logger.info("Processing %s (BSE=%s, id=%d)", name, bse_code, stock_id)
 
-        # Fetch manifest
+        # Fetch BSE announcements
         manifest = fetch_manifest(bse_code)
         if not manifest:
-            logger.info("  No filings returned for %s", name)
+            logger.info("  No announcements returned for %s", name)
+            sleep(CRAWL_DELAY_SECONDS)
             continue
 
         new_count: int = 0
@@ -126,25 +147,38 @@ def run_daily_pipeline() -> None:
             )
             new_count += 1
 
-            # Download and extract text
+            # Set filing type from BSE's newstype
+            if entry.get("filing_type"):
+                update_filing_type(conn, filing_id, entry["filing_type"])
+
+            # Download and extract text (skip if no PDF URL)
+            if not entry.get("pdf_url"):
+                update_filing_status(
+                    conn, filing_id, "NO_PDF", "No attachment available"
+                )
+                logger.info("    No PDF attachment → NO_PDF")
+                continue
+
             update_filing_status(conn, filing_id, "DOWNLOADING")
             raw_text = download_and_extract(entry["pdf_url"])
 
             if raw_text:
                 update_filing_raw_text(conn, filing_id, raw_text)
                 update_filing_status(conn, filing_id, "READY")
-                logger.info(
-                    "    Extracted %d chars → READY", len(raw_text)
-                )
+                logger.info("    Extracted %d chars → READY", len(raw_text))
             else:
                 update_filing_status(
-                    conn, filing_id, "ERROR_EXTRACTION",
+                    conn,
+                    filing_id,
+                    "ERROR_EXTRACTION",
                     "Download failed or scanned PDF (text < 100 chars)",
                 )
                 logger.info("    Extraction failed → ERROR_EXTRACTION")
                 total_errors += 1
 
         total_new += new_count
+        if manifest:
+            sleep(CRAWL_DELAY_SECONDS)
 
     conn.close()
     logger.info(
@@ -155,7 +189,7 @@ def run_daily_pipeline() -> None:
 
 
 def run_backlog() -> None:
-    """Retry ERROR_* filings from previous runs."""
+    """Retry ERROR_* and QUEUED filings from previous runs."""
     conn = init_db(DB_PATH)
     pending = get_pending_filings(conn)
     logger.info("Backlog: %d QUEUED filings to process", len(pending))

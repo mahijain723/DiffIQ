@@ -30,21 +30,21 @@ def conn():
 
 class TestStocks:
     def test_upsert_new(self, conn) -> None:
-        stock_id = upsert_stock(conn, "531456", "VEDL")
+        stock_id = upsert_stock(conn, "VEDL", "VEDL")
         assert stock_id is not None
         assert stock_id > 0
 
     def test_upsert_duplicate(self, conn) -> None:
-        id1 = upsert_stock(conn, "531456", "VEDL")
-        id2 = upsert_stock(conn, "531456", "VEDL")
+        id1 = upsert_stock(conn, "VEDL", "VEDL")
+        id2 = upsert_stock(conn, "VEDL", "VEDL")
         assert id1 == id2
 
     def test_get_by_bse_code(self, conn) -> None:
-        upsert_stock(conn, "531456", "VEDL")
-        row = get_stock_by_bse_code(conn, "531456")
+        upsert_stock(conn, "VEDL", "VEDL")
+        row = get_stock_by_bse_code(conn, "VEDL")
         assert row is not None
         assert row["name"] == "VEDL"
-        assert row["bse_code"] == "531456"
+        assert row["bse_code"] == "VEDL"
 
     def test_get_missing(self, conn) -> None:
         row = get_stock_by_bse_code(conn, "000000")

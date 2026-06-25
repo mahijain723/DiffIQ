@@ -21,13 +21,14 @@ st.set_page_config(
 )
 
 st.title("DiffIQ — Corporate Filing Monitor")
-st.caption("Tracks NSE portfolio stock filings from BSE.")
+st.caption("Tracks BSE-listed portfolio stock filings.")
 
 # -- Init DB on first load --
 if "db_inited" not in st.session_state:
     conn = init_db(DB_PATH)
     for s in STOCKS:
-        upsert_stock(conn, s["bse_code"], s["name"])
+        bse_code = s.get("bse_code") or s["symbol"]
+        upsert_stock(conn, bse_code, s["name"])
     conn.close()
     st.session_state["db_inited"] = True
 
@@ -38,7 +39,8 @@ def load_filings(stock_name: str) -> list[dict]:
     if not stock:
         return []
     conn = init_db(DB_PATH)
-    row = get_stock_by_bse_code(conn, stock["bse_code"])
+    bse_code = stock.get("bse_code") or stock["symbol"]
+    row = get_stock_by_bse_code(conn, bse_code)
     if not row:
         conn.close()
         return []
@@ -50,6 +52,10 @@ def load_filings(stock_name: str) -> list[dict]:
 # -- Stock selector --
 stock_names = [s["name"] for s in STOCKS]
 selected_stock = st.selectbox("Select Stock", stock_names, index=0)
+
+stock_data = next(s for s in STOCKS if s["name"] == selected_stock)
+bse_code = stock_data.get("bse_code") or "—"
+st.caption(f"BSE Code: {bse_code}")
 
 filings = load_filings(selected_stock)
 
@@ -66,7 +72,14 @@ if filings:
     cols[2].metric("Pending", pending)
     cols[3].metric("Errors", errors)
 else:
-    st.info("No filings found. Run the pipeline first: `python -m diffiq.pipeline`")
+    has_bse = bool(stock_data.get("bse_code"))
+    if not has_bse:
+        st.info(f"**{selected_stock}** is an ETF — no corporate filings to track.")
+    else:
+        st.info(
+            "No filings yet. Run the pipeline first:\n\n"
+            "`python -m diffiq.pipeline`"
+        )
 
 st.divider()
 
@@ -79,10 +92,18 @@ if filings:
             subject = f.get("subject", "") or ""
             cols[1].write(subject[:60] + ("..." if len(subject) > 60 else ""))
             cols[2].write(f.get("filing_type") or "—")
-            cols[3].write(f["status"])
+
+            status = f["status"]
+            if status == "READY":
+                cols[3].markdown(f"✅ {status}")
+            elif status.startswith("ERROR"):
+                cols[3].markdown(f"❌ {status}")
+            elif status == "NO_PDF":
+                cols[3].markdown(f"⏭️ {status}")
+            else:
+                cols[3].write(status)
+
             st.divider()
-else:
-    st.write("No data yet.")
 
 # -- Footer --
 st.caption(
