@@ -1,0 +1,4 @@
+pypdf
+httpx
+apscheduler
+streamlit
