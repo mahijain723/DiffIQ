@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS filings (
     updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE INDEX IF NOT EXISTS idx_filings_stock_type_date
+    ON filings(stock_id, filing_type, filing_date DESC);
+
 CREATE TABLE IF NOT EXISTS sections (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     filing_id   INTEGER NOT NULL REFERENCES filings(id),

@@ -1,21 +1,11 @@
-"""P0 pipeline — crawl BSE, download PDFs, extract text, store in SQLite."""
+"""P1 pipeline — crawl BSE, download PDFs, extract text, classify, sectionize, diff."""
 
-import hashlib
-import io
 import logging
 from pathlib import Path
 from time import sleep
 
-import httpx
-import pypdf
-
-from diffiq.config import (
-    STOCKS,
-    DB_PATH,
-    PDF_CACHE_DIR,
-    PDF_DOWNLOAD_TIMEOUT,
-    CRAWL_DELAY_SECONDS,
-)
+from diffiq.classifier import classify_filing
+from diffiq.config import STOCKS, DB_PATH, PDF_CACHE_DIR, CRAWL_DELAY_SECONDS
 from diffiq.crawler import fetch_manifest
 from diffiq.db import (
     get_filing_by_uuid,
@@ -26,59 +16,11 @@ from diffiq.db import (
     update_filing_type,
     upsert_stock,
 )
+from diffiq.differ import run_diffs_for_filing
+from diffiq.extractor import extract_and_store_sections, download_pdf_text
 from diffiq.schema import init_db
 
 logger = logging.getLogger(__name__)
-
-USER_AGENT: str = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
-
-
-def download_and_extract(pdf_url: str) -> str | None:
-    """Download a PDF and extract its text using pypdf.
-
-    Args:
-        pdf_url: Full URL to the PDF file.
-
-    Returns:
-        Extracted text as a single string, or None on failure
-        (download error, corrupted PDF, or extraction returns < 100 chars).
-    """
-    try:
-        with httpx.Client(timeout=PDF_DOWNLOAD_TIMEOUT) as client:
-            resp = client.get(
-                pdf_url,
-                headers={"User-Agent": USER_AGENT},
-            )
-            resp.raise_for_status()
-    except httpx.HTTPError as e:
-        logger.warning("PDF download failed: %s — %s", pdf_url, e)
-        return None
-
-    try:
-        reader = pypdf.PdfReader(io.BytesIO(resp.content))
-        pages: list[str] = []
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                pages.append(text)
-    except Exception as e:
-        logger.warning("pypdf extraction failed for %s: %s", pdf_url, e)
-        return None
-
-    full_text: str = "\n".join(pages)
-
-    if len(full_text) < 100:
-        logger.info(
-            "Extracted text too short (%d chars) — likely scanned PDF",
-            len(full_text),
-        )
-        return None
-
-    return full_text
 
 
 def run_daily_pipeline() -> None:
@@ -160,20 +102,40 @@ def run_daily_pipeline() -> None:
                 continue
 
             update_filing_status(conn, filing_id, "DOWNLOADING")
-            raw_text = download_and_extract(entry["pdf_url"])
+            result = download_pdf_text(entry["pdf_url"])
 
-            if raw_text:
-                update_filing_raw_text(conn, filing_id, raw_text)
+            if result.text:
+                update_filing_raw_text(conn, filing_id, result.text)
                 update_filing_status(conn, filing_id, "READY")
-                logger.info("    Extracted %d chars → READY", len(raw_text))
+                logger.info(
+                    "    Extracted %d chars → READY", len(result.text)
+                )
+
+                # P1: classify → sectionize → diff
+                ft = entry.get("filing_type")
+                if not ft:
+                    ft = classify_filing(entry.get("subject", ""))
+                    update_filing_type(conn, filing_id, ft)
+
+                extract_and_store_sections(
+                    conn, filing_id, result.text, ft
+                )
+                run_diffs_for_filing(conn, filing_id, stock_id, ft)
+
+                conn.commit()
             else:
+                error_msg = result.error or "Unknown extraction error"
                 update_filing_status(
                     conn,
                     filing_id,
                     "ERROR_EXTRACTION",
-                    "Download failed or scanned PDF (text < 100 chars)",
+                    error_msg,
                 )
-                logger.info("    Extraction failed → ERROR_EXTRACTION")
+                conn.commit()
+                logger.info(
+                    "    Extraction failed → ERROR_EXTRACTION: %s",
+                    error_msg,
+                )
                 total_errors += 1
 
         total_new += new_count
@@ -194,6 +156,48 @@ def run_backlog() -> None:
     pending = get_pending_filings(conn)
     logger.info("Backlog: %d QUEUED filings to process", len(pending))
     conn.close()
+
+
+def sync() -> None:
+    """Backfill all existing READY filings through classify → sectionize → differ."""
+    conn = init_db(DB_PATH)
+
+    rows = conn.execute(
+        "SELECT id, stock_id, subject, raw_text, filing_type FROM filings WHERE status = 'READY'"
+    ).fetchall()
+
+    if not rows:
+        logger.info("No READY filings to sync")
+        conn.close()
+        return
+
+    logger.info("Syncing %d READY filings", len(rows))
+
+    for row in rows:
+        filing_id = row["id"]
+        stock_id = row["stock_id"]
+        filing_type = row["filing_type"]
+
+        if not filing_type:
+            filing_type = classify_filing(row["subject"] or "")
+            update_filing_type(conn, filing_id, filing_type)
+
+        raw_text = row["raw_text"]
+        if not raw_text:
+            continue
+
+        existing = conn.execute(
+            "SELECT COUNT(*) as cnt FROM sections WHERE filing_id = ?",
+            (filing_id,),
+        ).fetchone()
+        if existing and existing["cnt"] == 0:
+            extract_and_store_sections(conn, filing_id, raw_text, filing_type)
+
+        run_diffs_for_filing(conn, filing_id, stock_id, filing_type)
+
+    conn.commit()
+    conn.close()
+    logger.info("Sync complete")
 
 
 if __name__ == "__main__":

@@ -32,7 +32,6 @@ def insert_filing(
            VALUES (?, ?, ?, ?, ?)""",
         (stock_id, filing_uuid, filing_date, subject, pdf_url),
     )
-    conn.commit()
     return cur.lastrowid
 
 
@@ -44,7 +43,6 @@ def update_filing_status(
         "UPDATE filings SET status = ?, error = ?, updated_at = datetime('now') WHERE id = ?",
         (status, error, filing_id),
     )
-    conn.commit()
 
 
 def update_filing_type(
@@ -55,7 +53,6 @@ def update_filing_type(
         "UPDATE filings SET filing_type = ?, updated_at = datetime('now') WHERE id = ?",
         (filing_type, filing_id),
     )
-    conn.commit()
 
 
 def update_filing_raw_text(
@@ -66,7 +63,6 @@ def update_filing_raw_text(
         "UPDATE filings SET raw_text = ?, updated_at = datetime('now') WHERE id = ?",
         (raw_text, filing_id),
     )
-    conn.commit()
 
 
 def get_filings_for_stock(
@@ -134,7 +130,6 @@ def insert_sections(
                 sec["section_idx"],
             ),
         )
-    conn.commit()
 
 
 def get_sections(
@@ -155,7 +150,6 @@ def insert_diff(conn: sqlite3.Connection, diff_data: dict) -> int:
            VALUES (:stock_id, :filing_id_new, :section_id_new, :section_header, :diff_text, :changed)""",
         diff_data,
     )
-    conn.commit()
     return cur.lastrowid
 
 
@@ -169,6 +163,38 @@ def get_diffs_for_stock(
            ORDER BY created_at DESC
            LIMIT ?""",
         (stock_id, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_portfolio_summary(
+    conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Aggregate per-stock filing stats for the portfolio overview.
+
+    Returns one row per stock with:
+        id, bse_code, name, total_filings, ready_count, error_count,
+        latest_filing_date, latest_subject.
+    """
+    rows = conn.execute(
+        """SELECT
+               s.id,
+               s.bse_code,
+               s.name,
+               COUNT(f.id)                                            AS total_filings,
+               SUM(CASE WHEN f.status = 'READY'        THEN 1 ELSE 0 END) AS ready_count,
+               SUM(CASE WHEN f.status LIKE 'ERROR_%'   THEN 1 ELSE 0 END) AS error_count,
+               MAX(f.filing_date)                                      AS latest_filing_date,
+               (SELECT f2.subject
+                FROM filings f2
+                WHERE f2.stock_id = s.id AND f2.status = 'READY'
+                ORDER BY f2.filing_date DESC, f2.created_at DESC
+                LIMIT 1)                                               AS latest_subject
+           FROM stocks s
+           LEFT JOIN filings f ON f.stock_id = s.id
+           WHERE s.bse_code != ''
+           GROUP BY s.id
+           ORDER BY s.name"""
     ).fetchall()
     return [dict(r) for r in rows]
 
