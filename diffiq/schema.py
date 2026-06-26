@@ -64,8 +64,13 @@ CREATE TABLE IF NOT EXISTS diffs (
 
 
 def init_db(db_path: str | Path) -> sqlite3.Connection:
-    """Create tables if not exist. Returns connection with Row factory."""
-    conn = sqlite3.connect(str(db_path))
+    """Create tables if not exist. Returns connection with Row factory.
+
+    check_same_thread=False is intentional — the connection is cached via
+    @st.cache_resource and may be used from a different thread on rerun.
+    WAL mode + busy_timeout (set below) handle concurrent access safely.
+    """
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
     conn.commit()
