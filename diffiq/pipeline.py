@@ -92,6 +92,107 @@ def _process_pdf_result(
 _PDF_WORKERS = 3
 
 
+def process_stock_announcements(
+    conn: sqlite3.Connection,
+    bse_code: str,
+    name: str,
+    stock_id: int | None = None,
+) -> dict[str, int]:
+    """Fetch announcements, download PDFs, extract, sectionize, diff for one stock.
+
+    Caller owns the connection lifecycle and should commit after calling.
+
+    Args:
+        conn: SQLite connection.
+        bse_code: BSE scrip code.
+        name: Stock symbol/name.
+        stock_id: Optional pre-resolved stock ID. If None, resolved from bse_code.
+
+    Returns:
+        dict with keys: new_count, error_count.
+    """
+    if stock_id is None:
+        stock_id = upsert_stock(conn, bse_code, name)
+    logger.info("Processing %s (BSE=%s, id=%d)", name, bse_code, stock_id)
+
+    manifest = fetch_manifest(bse_code)
+    if not manifest:
+        logger.info("  No announcements returned for %s", name)
+        return {"new_count": 0, "error_count": 0}
+
+    new_count: int = 0
+    error_count: int = 0
+    pdf_entries: list[tuple[dict, int]] = []
+
+    for entry in manifest:
+        existing = get_filing_by_uuid(conn, entry["filing_uuid"])
+        if existing:
+            continue
+
+        filing_id = insert_filing(
+            conn,
+            stock_id,
+            entry["filing_uuid"],
+            entry["filing_date"],
+            entry["subject"],
+            entry["pdf_url"],
+        )
+        logger.info(
+            "  New filing [%d]: %s — %s",
+            filing_id,
+            entry["filing_date"],
+            entry["subject"][:60],
+        )
+        new_count += 1
+
+        if entry.get("filing_type"):
+            update_filing_type(conn, filing_id, entry["filing_type"])
+
+        if not entry.get("pdf_url"):
+            update_filing_status(
+                conn, filing_id, "NO_PDF", "No attachment available",
+            )
+            logger.info("    No PDF attachment → NO_PDF")
+            continue
+
+        update_filing_status(conn, filing_id, "DOWNLOADING")
+        pdf_entries.append((entry, filing_id))
+
+    conn.commit()
+
+    if pdf_entries:
+        with ThreadPoolExecutor(max_workers=_PDF_WORKERS) as pool:
+            future_map = {
+                pool.submit(download_pdf_text, en["pdf_url"]): (en, fid)
+                for en, fid in pdf_entries
+            }
+            for future in as_completed(future_map):
+                entry, filing_id = future_map[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    logger.warning(
+                        "    Filing %d download failed with exception: %s",
+                        filing_id, e,
+                    )
+                    update_filing_status(
+                        conn, filing_id, "ERROR_DOWNLOAD",
+                        f"Exception: {e}",
+                    )
+                    conn.commit()
+                    error_count += 1
+                    continue
+
+                ok = _process_pdf_result(
+                    conn, entry, filing_id, stock_id, result,
+                )
+                if not ok:
+                    error_count += 1
+                conn.commit()
+
+    return {"new_count": new_count, "error_count": error_count}
+
+
 def run_daily_pipeline(
     conn: sqlite3.Connection | None = None,
 ) -> None:
@@ -137,94 +238,10 @@ def run_daily_pipeline(
                 continue
 
             name: str = stock["name"]
-
-            # Ensure stock is in DB (use BSE code as unique identifier)
-            stock_id: int = upsert_stock(conn, bse_code, name)
-            logger.info("Processing %s (BSE=%s, id=%d)", name, bse_code, stock_id)
-
-            # Fetch BSE announcements
-            manifest = fetch_manifest(bse_code)
-            if not manifest:
-                logger.info("  No announcements returned for %s", name)
-                sleep(CRAWL_DELAY_SECONDS)
-                continue
-
-            new_count: int = 0
-            pdf_entries: list[tuple[dict, int]] = []
-
-            # First pass: insert new filings, classify, identify PDF-enabled ones
-            for entry in manifest:
-                existing = get_filing_by_uuid(conn, entry["filing_uuid"])
-                if existing:
-                    continue
-
-                filing_id = insert_filing(
-                    conn,
-                    stock_id,
-                    entry["filing_uuid"],
-                    entry["filing_date"],
-                    entry["subject"],
-                    entry["pdf_url"],
-                )
-                logger.info(
-                    "  New filing [%d]: %s — %s",
-                    filing_id,
-                    entry["filing_date"],
-                    entry["subject"][:60],
-                )
-                new_count += 1
-
-                if entry.get("filing_type"):
-                    update_filing_type(conn, filing_id, entry["filing_type"])
-
-                if not entry.get("pdf_url"):
-                    update_filing_status(
-                        conn, filing_id, "NO_PDF", "No attachment available"
-                    )
-                    logger.info("    No PDF attachment → NO_PDF")
-                    continue
-
-                update_filing_status(conn, filing_id, "DOWNLOADING")
-                pdf_entries.append((entry, filing_id))
-
-            # Persist NO_PDF statuses before starting downloads
-            conn.commit()
-
-            # Second pass: download PDFs in parallel, process results sequentially
-            if pdf_entries:
-                conn.commit()
-                with ThreadPoolExecutor(max_workers=_PDF_WORKERS) as pool:
-                    future_map = {
-                        pool.submit(download_pdf_text, en["pdf_url"]): (en, fid)
-                        for en, fid in pdf_entries
-                    }
-                    for future in as_completed(future_map):
-                        entry, filing_id = future_map[future]
-                        try:
-                            result = future.result()
-                        except Exception as e:
-                            logger.warning(
-                                "    Filing %d download failed with exception: %s",
-                                filing_id, e,
-                            )
-                            update_filing_status(
-                                conn, filing_id, "ERROR_DOWNLOAD",
-                                f"Exception: {e}",
-                            )
-                            conn.commit()
-                            total_errors += 1
-                            continue
-
-                        ok = _process_pdf_result(
-                            conn, entry, filing_id, stock_id, result,
-                        )
-                        if not ok:
-                            total_errors += 1
-                        conn.commit()
-
-            total_new += new_count
-            if manifest:
-                sleep(CRAWL_DELAY_SECONDS)
+            stats = process_stock_announcements(conn, bse_code, name)
+            total_new += stats["new_count"]
+            total_errors += stats["error_count"]
+            sleep(CRAWL_DELAY_SECONDS)
     finally:
         _release_pipeline_lock(conn)
         if managed:

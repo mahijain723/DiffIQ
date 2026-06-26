@@ -145,24 +145,69 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.markdown("**Add Stock**")
-    add_name = st.text_input(
-        "Symbol", placeholder="e.g. INFY", key="add_name",
+    symbol = st.text_input(
+        "Symbol", placeholder="e.g. INFY", key="add_symbol",
     )
-    add_bse = st.text_input(
-        "BSE Code", placeholder="e.g. 500209", key="add_bse",
-    )
+
+    # Manual BSE code input — shown only when auto-lookup fails
+    if st.session_state.get("show_manual_bse"):
+        manual_bse = st.text_input(
+            "BSE Code (manual)", placeholder="e.g. 500209",
+            key="add_bse_manual",
+        )
+        if st.button("Add Manually", type="secondary"):
+            if symbol and manual_bse:
+                conn = get_connection()
+                db.add_stock(conn, manual_bse.strip(), symbol.strip().upper())
+                conn.commit()
+                st.session_state.show_manual_bse = False
+                st.rerun()
+            else:
+                st.warning("Both symbol and BSE code are required.")
+
     if st.button("Add to Watchlist", type="primary"):
-        if add_name and add_bse:
-            conn = get_connection()
-            db.add_stock(
-                conn,
-                add_bse.strip(),
-                add_name.strip().upper(),
-            )
-            conn.commit()
-            st.rerun()
+        if not symbol:
+            st.warning("Enter a stock symbol.")
         else:
-            st.warning("Both symbol and BSE code are required.")
+            # 1. Auto-resolve BSE code
+            try:
+                from bse import BSE
+                with BSE(download_folder=".") as b:
+                    result = b.lookup(symbol.strip().upper())
+            except Exception:
+                result = None
+
+            if result:
+                bse_code = result["bse_code"]
+                company = result["company_name"]
+
+                # 2. Add to DB
+                conn = get_connection()
+                db.add_stock(conn, bse_code, symbol.strip().upper())
+                conn.commit()
+
+                # 3. Fetch filings for this stock
+                with st.spinner(f"Fetching filings for {symbol.upper()}..."):
+                    from diffiq.pipeline import process_stock_announcements
+                    c2 = get_connection()
+                    stats = process_stock_announcements(
+                        c2, bse_code, symbol.strip().upper(),
+                    )
+                    c2.commit()
+                    c2.close()
+
+                st.success(
+                    f"Added {symbol.upper()} ({bse_code}) "
+                    f"— {stats['new_count']} new filings"
+                )
+                st.rerun()
+            else:
+                st.session_state.show_manual_bse = True
+                st.warning(
+                    f"Could not auto-resolve {symbol.upper()}. "
+                    "Enter the BSE code manually below."
+                )
+                st.rerun()
 
 with col2:
     st.markdown("**Current Watchlist**")

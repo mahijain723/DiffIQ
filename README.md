@@ -155,7 +155,7 @@ Opens a browser UI at `localhost:8501`. Shows:
 - **Stock browser** — select a stock, see all filings with status badges
 - **Filing detail** — expand a filing to see its metadata, sections, and diffs against the prior filing
 - **Section diff UI** — sections with changes auto-expand with a green "Changed" badge and code diff view
-- **Watchlist management** — add/remove stocks directly from the dashboard (persisted to DB)
+- **Watchlist management** — add/remove stocks directly from the dashboard, auto-resolves BSE codes and auto-fetches filings
 
 ---
 
@@ -301,7 +301,9 @@ Example: adding a "MERGER" type:
 
 ### Adding a new stock
 
-Add to the watchlist via the dashboard **Watchlist Management** section or edit `config.py:STOCKS`. Find the BSE scrip code (numeric) from the BSE website stock profile page.
+Add via the dashboard **Watchlist Management** section — just enter the ticker symbol (e.g. `INFY`) and click **Add to Watchlist**. The BSE scrip code is resolved automatically via `bse.lookup()`, and the pipeline fetches filings immediately.
+
+If the symbol can't be resolved, a manual BSE code input appears for entry. You can also edit `config.py:STOCKS` to seed the initial watchlist.
 
 ### Customizing the dashboard
 
