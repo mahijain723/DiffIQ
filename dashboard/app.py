@@ -13,17 +13,7 @@ import sqlite3
 
 from diffiq.config import STOCKS, DB_PATH
 from diffiq.dashboard_utils import status_badge_html
-from diffiq.db import (
-    add_stock,
-    get_all_stocks,
-    get_diffs_for_filings,
-    get_filings_for_stock,
-    get_portfolio_summary,
-    get_sections_for_filings,
-    get_stock_by_bse_code,
-    remove_stock,
-    upsert_stock,
-)
+import diffiq.db as db
 from diffiq.schema import SCHEMA_SQL, init_db
 
 st.set_page_config(
@@ -58,7 +48,7 @@ def get_connection():
 def _get_cached_portfolio():
     """Portfolio summary, cached for 30s."""
     conn = get_connection()
-    return get_portfolio_summary(conn)
+    return db.get_portfolio_summary(conn)
 
 
 @st.cache_data(ttl=30)
@@ -74,10 +64,10 @@ def _get_cached_filings(bse_code: str):
     if not bse_code:
         return []
     conn = get_connection()
-    row = get_stock_by_bse_code(conn, bse_code)
+    row = db.get_stock_by_bse_code(conn, bse_code)
     if not row:
         return []
-    return get_filings_for_stock(conn, row["id"], limit=50)
+    return db.get_filings_for_stock(conn, row["id"], limit=50)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -87,7 +77,7 @@ if "db_inited" not in st.session_state:
     _init_conn = init_db(DB_PATH)
     for s in STOCKS:
         bse_code = s.get("bse_code") or s["name"]
-        upsert_stock(_init_conn, bse_code, s["name"])
+        db.upsert_stock(_init_conn, bse_code, s["name"])
     _init_conn.commit()
     _init_conn.close()
     st.session_state["db_inited"] = True
@@ -147,7 +137,7 @@ st.divider()
 # ══════════════════════════════════════════════════════════════════
 # Stock Selector (from DB — STOCKS config is seed only)
 # ══════════════════════════════════════════════════════════════════
-all_stocks = get_all_stocks(get_connection())
+all_stocks = db.get_all_stocks(get_connection())
 if not all_stocks:
     st.info("Watchlist is empty. Add stocks using the Manage Watchlist section below.")
     st.stop()
@@ -188,14 +178,14 @@ st.divider()
 # ══════════════════════════════════════════════════════════════════
 if filings:
     conn = get_connection()
-    stock_row = get_stock_by_bse_code(conn, bse_code)
+    stock_row = db.get_stock_by_bse_code(conn, bse_code)
     stock_id = stock_row["id"] if stock_row else None
 
     # Batch-fetch sections and diffs for all READY filings at once
     ready_ids = [f["id"] for f in filings if f["status"] == "READY"]
-    all_sections = get_sections_for_filings(conn, ready_ids) if ready_ids else {}
+    all_sections = db.get_sections_for_filings(conn, ready_ids) if ready_ids else {}
     all_diffs = (
-        get_diffs_for_filings(conn, ready_ids, stock_id)
+        db.get_diffs_for_filings(conn, ready_ids, stock_id)
         if ready_ids and stock_id
         else {}
     )
@@ -289,7 +279,7 @@ with st.expander("Manage Watchlist", expanded=False):
         if st.button("Add to Watchlist", type="primary"):
             if add_name and add_bse:
                 conn = get_connection()
-                add_stock(
+                db.add_stock(
                     conn,
                     add_bse.strip(),
                     add_name.strip().upper(),
@@ -305,13 +295,13 @@ with st.expander("Manage Watchlist", expanded=False):
     with col2:
         st.markdown("**Current Watchlist**")
         conn = get_connection()
-        watchlist = get_all_stocks(conn)
+        watchlist = db.get_all_stocks(conn)
         if watchlist:
             for s in watchlist:
                 c1, c2 = st.columns([3, 1])
                 c1.write(f"{s['name']} ({s['bse_code']})")
                 if c2.button("Remove", key=f"rm_{s['id']}"):
-                    remove_stock(conn, s["id"])
+                    db.remove_stock(conn, s["id"])
                     conn.commit()
                     st.rerun()
         else:
