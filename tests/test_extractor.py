@@ -143,6 +143,7 @@ class TestDownloadPdfText:
         """Valid PDF returns ExtractionResult with text."""
         mock_resp = MagicMock()
         mock_resp.raise_for_status.return_value = None
+        mock_resp.headers = {}
         mock_resp.content = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj trailer<</Root 1 0 R>>"
         mock_client = MagicMock()
         mock_client.__enter__.return_value = mock_client
@@ -175,6 +176,7 @@ class TestDownloadPdfText:
         """Non-PDF content returns ExtractionResult with error."""
         mock_resp = MagicMock()
         mock_resp.raise_for_status.return_value = None
+        mock_resp.headers = {}
         mock_resp.content = b"Not a PDF at all, just some text content"
         mock_client = MagicMock()
         mock_client.__enter__.return_value = mock_client
@@ -190,6 +192,7 @@ class TestDownloadPdfText:
         """PDF with very short text (< 100 chars) returns error."""
         mock_resp = MagicMock()
         mock_resp.raise_for_status.return_value = None
+        mock_resp.headers = {}
         mock_resp.content = b"%PDF-1.4 tiny doc..."
         mock_client = MagicMock()
         mock_client.__enter__.return_value = mock_client

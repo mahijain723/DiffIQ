@@ -10,11 +10,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from diffiq.config import STOCKS, DB_PATH
+from diffiq.dashboard_utils import status_badge_html
 from diffiq.db import (
-    get_diffs_for_filing,
+    get_diffs_for_filings,
     get_filings_for_stock,
     get_portfolio_summary,
-    get_sections,
+    get_sections_for_filings,
     get_stock_by_bse_code,
     upsert_stock,
 )
@@ -26,50 +27,62 @@ st.set_page_config(
     layout="centered",
 )
 
-# ── CSS ─────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-/* Stock cards */
-.stock-card { border:1px solid #EAEAEA; border-radius:8px; padding:16px;
-    text-align:center; background:#F9F9F8; margin-bottom:4px; }
-.stock-card-name { font-weight:600; font-size:1rem; }
-.stock-card-code { color:#888; font-size:0.8rem; }
-
-/* Status badges */
-.badge { display:inline-block; padding:2px 10px; border-radius:9999px;
-    font-size:0.75rem; font-weight:600; white-space:nowrap; }
-.badge-ready { background:#EDF3EC; color:#346538; }
-.badge-error { background:#FDEBEC; color:#9F2F2D; }
-.badge-queued { background:#FBF3DB; color:#956400; }
-.badge-no-pdf { background:#F0F0F0; color:#666; }
-.badge-downloading { background:#E1F3FE; color:#1F6C9F; }
-
-/* Section diff badge */
-.diff-badge { display:inline-flex; align-items:center; gap:4px;
-    background:#EDF3EC; color:#346538; padding:2px 10px;
-    border-radius:9999px; font-size:0.75rem; font-weight:600; }
-
-/* Header */
-.main-header { display:flex; align-items:center; gap:10px; margin-bottom:0; }
-</style>""", unsafe_allow_html=True)
-
-# ── Cached Connection ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# Cached connection
+# ══════════════════════════════════════════════════════════════════
 @st.cache_resource
 def get_connection():
     """Single DB connection per session — avoids re-init on every rerun."""
     return init_db(DB_PATH)
 
 
-# ── Session init ────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# Cached data helpers (30s TTL — avoids repeated SQLite hits on rerun)
+# ══════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=30)
+def _get_cached_portfolio():
+    """Portfolio summary, cached for 30s."""
+    conn = get_connection()
+    return get_portfolio_summary(conn)
+
+
+@st.cache_data(ttl=30)
+def _get_cached_filings(stock_name: str, bse_code_for_cache: str):
+    """Filings list per stock, cached for 30s.
+
+    Args:
+        stock_name: Stock name as displayed in selectbox.
+        bse_code_for_cache: BSE code used as cache key discriminator
+            (ensures cache invalidates across stocks).
+
+    Returns:
+        List of filing dicts, or empty list if stock not found.
+    """
+    stock = next((s for s in STOCKS if s["name"] == stock_name), None)
+    if not stock:
+        return []
+    conn = get_connection()
+    bse_code = stock.get("bse_code") or stock["symbol"]
+    row = get_stock_by_bse_code(conn, bse_code)
+    if not row:
+        return []
+    return get_filings_for_stock(conn, row["id"], limit=50)
+
+
+# ══════════════════════════════════════════════════════════════════
+# Session init
+# ══════════════════════════════════════════════════════════════════
 if "db_inited" not in st.session_state:
     conn = get_connection()
     for s in STOCKS:
         bse_code = s.get("bse_code") or s["symbol"]
         upsert_stock(conn, bse_code, s["name"])
-    conn.commit()  # pipeline owns transactions
+    conn.commit()
     st.session_state["db_inited"] = True
 
-# ── Header (Lucide file-text SVG, no em-dash) ──────────────────
+# ══════════════════════════════════════════════════════════════════
+# Header
+# ══════════════════════════════════════════════════════════════════
 st.markdown(
     '<div class="main-header">'
     '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" '
@@ -87,23 +100,20 @@ st.markdown(
 )
 st.caption("Tracks BSE-listed portfolio stock filings.")
 
-# ── Portfolio Overview ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# Portfolio Overview
+# ══════════════════════════════════════════════════════════════════
 st.subheader("Portfolio Overview")
 
 with st.spinner("Loading portfolio..."):
-    conn = get_connection()
-    summary = get_portfolio_summary(conn)
+    summary = _get_cached_portfolio()
 
 if summary:
     for i in range(0, len(summary), 4):
-        row = summary[i:i + 4]
+        row_stocks = summary[i:i + 4]
         cols = st.columns(4)
-        for j, stock in enumerate(row):
+        for j, stock in enumerate(row_stocks):
             with cols[j]:
-                total = stock["total_filings"]
-                ready = stock["ready_count"]
-                errors = stock["error_count"]
-
                 st.markdown(
                     f'<div class="stock-card">'
                     f'<div class="stock-card-name">{stock["name"]}</div>'
@@ -111,10 +121,10 @@ if summary:
                     f'</div>',
                     unsafe_allow_html=True,
                 )
-                st.metric("Total Filings", total)
+                st.metric("Total Filings", stock["total_filings"])
                 inner = st.columns(2)
-                inner[0].metric("Ready", ready)
-                inner[1].metric("Errors", errors)
+                inner[0].metric("Ready", stock["ready_count"])
+                inner[1].metric("Errors", stock["error_count"])
                 if stock["latest_filing_date"]:
                     st.caption(f"Latest: {stock['latest_filing_date']}")
 else:
@@ -122,43 +132,9 @@ else:
 
 st.divider()
 
-# ── Helpers ─────────────────────────────────────────────────────
-def load_filings(stock_name: str) -> list[dict]:
-    """Fetch filings for a stock using the cached connection."""
-    stock = next((s for s in STOCKS if s["name"] == stock_name), None)
-    if not stock:
-        return []
-    conn = get_connection()
-    bse_code = stock.get("bse_code") or stock["symbol"]
-    row = get_stock_by_bse_code(conn, bse_code)
-    if not row:
-        return []
-    return get_filings_for_stock(conn, row["id"], limit=50)
-
-
-def status_badge_html(status: str) -> str:
-    """Render a color-coded status badge span.
-
-    Maps status strings to muted-pastel badges matching the minimalist
-    colour palette: green (ready), red (error), amber (queued), gray (no-pdf),
-    blue (downloading).
-    """
-    if status.startswith("ERROR_"):
-        return '<span class="badge badge-error">Error</span>'
-    css = status.lower().replace("_", "-")
-    labels = {
-        "ready": "Ready",
-        "queued": "Queued",
-        "no-pdf": "No PDF",
-        "downloading": "Downloading",
-    }
-    label = labels.get(css, status)
-    known = {"ready", "error", "queued", "no-pdf", "downloading"}
-    css_class = css if css in known else "error"
-    return f'<span class="badge badge-{css_class}">{label}</span>'
-
-
-# ── Stock Selector ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# Stock Selector
+# ══════════════════════════════════════════════════════════════════
 stock_names = [s["name"] for s in STOCKS]
 selected_stock = st.selectbox("Select Stock", stock_names, index=0)
 
@@ -167,24 +143,27 @@ bse_code = stock_data.get("bse_code") or "-"
 st.caption(f"BSE Code: {bse_code}")
 
 with st.spinner("Loading filings..."):
-    filings = load_filings(selected_stock)
+    bse_cache_key = stock_data.get("bse_code") or stock_data["symbol"]
+    filings = _get_cached_filings(selected_stock, bse_cache_key)
 
-# ── Filing Summary Metrics ──────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# Filing Summary Metrics
+# ══════════════════════════════════════════════════════════════════
 if filings:
     total = len(filings)
-    ready = sum(1 for f in filings if f["status"] == "READY")
-    errors = sum(1 for f in filings if f["status"].startswith("ERROR"))
-    pending = sum(1 for f in filings if f["status"] == "QUEUED")
+    ready_count = sum(1 for f in filings if f["status"] == "READY")
+    error_count = sum(1 for f in filings if f["status"].startswith("ERROR"))
+    pending_count = sum(1 for f in filings if f["status"] == "QUEUED")
 
     cols = st.columns(4)
     cols[0].metric("Total Filings", total)
-    cols[1].metric("Ready", ready)
-    cols[2].metric("Pending", pending)
-    cols[3].metric("Errors", errors)
+    cols[1].metric("Ready", ready_count)
+    cols[2].metric("Pending", pending_count)
+    cols[3].metric("Errors", error_count)
 else:
     has_bse = bool(stock_data.get("bse_code"))
     if not has_bse:
-        st.info(f"**{selected_stock}** is an ETF - no corporate filings to track.")
+        st.info(f"**{selected_stock}** is an ETF — no corporate filings to track.")
     else:
         st.info(
             "No filings yet. Run the pipeline first:\n\n"
@@ -193,11 +172,22 @@ else:
 
 st.divider()
 
-# ── Filing Expanders ────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# Filing Expanders — with batch section/diff queries
+# ══════════════════════════════════════════════════════════════════
 if filings:
     conn = get_connection()
     stock_row = get_stock_by_bse_code(conn, bse_code)
     stock_id = stock_row["id"] if stock_row else None
+
+    # Batch-fetch sections and diffs for all READY filings at once
+    ready_ids = [f["id"] for f in filings if f["status"] == "READY"]
+    all_sections = get_sections_for_filings(conn, ready_ids) if ready_ids else {}
+    all_diffs = (
+        get_diffs_for_filings(conn, ready_ids, stock_id)
+        if ready_ids and stock_id
+        else {}
+    )
 
     for f in filings:
         fid = f["id"]
@@ -222,24 +212,24 @@ if filings:
             if f.get("error"):
                 st.error(f"Error: {f['error']}")
 
-            # Sections with diffs
+            # Sections with diffs (uses pre-fetched batch data)
             if status == "READY":
-                sections = get_sections(conn, fid)
+                sections = all_sections.get(fid, [])
                 if sections:
                     st.markdown(f"**Sections ({len(sections)})**")
 
-                    if stock_id:
-                        diffs = {
-                            d["section_header"]: d
-                            for d in get_diffs_for_filing(conn, fid, stock_id)
-                        }
-                    else:
-                        diffs = {}
+                    diffs_by_header: dict = {}
+                    if stock_id and fid in all_diffs:
+                        for d in all_diffs[fid]:
+                            diffs_by_header[d["section_header"]] = d
 
                     for sec in sections:
                         header = sec["header"]
                         sec_text = sec.get("text", "")
-                        has_diff = header in diffs and diffs[header].get("changed")
+                        has_diff = (
+                            header in diffs_by_header
+                            and diffs_by_header[header].get("changed")
+                        )
 
                         with st.expander(
                             f"**{header}**",
@@ -265,11 +255,9 @@ if filings:
 
                             if has_diff:
                                 st.code(
-                                    diffs[header].get("diff_text", "")[:2000],
+                                    diffs_by_header[header].get("diff_text", "")[:2000],
                                     language="diff",
                                 )
-
-    conn.close()
 
 st.caption(
     "Data source: BSE Corporate Announcements API. "

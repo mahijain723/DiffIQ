@@ -8,39 +8,45 @@ from diffiq.db import get_filings_for_stock, update_filing_type
 
 logger = logging.getLogger(__name__)
 
-PATTERNS: list[tuple[str, str]] = [
-    ("AUDIT_REPORT", r"\baudit"),
-    ("FINANCIAL_RESULT", r"(?=.*\bresult(?:s)?\b)(?=.*\b(?:quarter(?:ly)?|half\s*year(?:ly)?|annual|standalone|consolidated|financial)\b)"),
-    ("RPT", r"\b(?:related\s*party|rpt)\b"),
-    ("PROMOTER_CHANGE", r"\b(?:promoter|pledge|shareholding\s*pattern)\b"),
-    ("BOARD_OUTCOME", r"\bboard\b.*\b(?:meeting|outcome|resolution)\b"),
-]
+class _FilingClassifier:
+    """Filing type classifier with pre-compiled regex patterns."""
 
+    def __init__(self) -> None:
+        self._patterns: list[tuple[str, re.Pattern]] = [
+            ("AUDIT_REPORT", re.compile(r"\baudit", re.IGNORECASE)),
+            (
+                "FINANCIAL_RESULT",
+                re.compile(
+                    r"(?=.*\bresult(?:s)?\b)"
+                    r"(?=.*\b(?:quarter(?:ly)?|half\s*year(?:ly)?|annual|standalone|consolidated|financial)\b)",
+                    re.IGNORECASE,
+                ),
+            ),
+            ("RPT", re.compile(r"\b(?:related\s*party|rpt)\b", re.IGNORECASE)),
+            ("PROMOTER_CHANGE", re.compile(r"\b(?:promoter|pledge|shareholding\s*pattern)\b", re.IGNORECASE)),
+            ("BOARD_OUTCOME", re.compile(r"\bboard\b.*\b(?:meeting|outcome|resolution)\b", re.IGNORECASE)),
+        ]
 
-def classify_filing(subject: str, raw_text: str | None = None) -> str:
-    """Classify a filing by its subject line using regex patterns.
+    def classify(self, subject: str) -> str:
+        """Classify a filing by its subject line.
 
-    First match wins; returns ROUTINE if no pattern matches.
+        Args:
+            subject: The filing subject line.
 
-    Args:
-        subject: The filing subject line.
-        raw_text: Unused; reserved for future content-based classification.
-
-    Returns:
-        A filing type string: AUDIT_REPORT, FINANCIAL_RESULT, RPT,
-        PROMOTER_CHANGE, BOARD_OUTCOME, or ROUTINE.
-    """
-    if not subject:
+        Returns:
+            A filing type string: AUDIT_REPORT, FINANCIAL_RESULT, RPT,
+            PROMOTER_CHANGE, BOARD_OUTCOME, or ROUTINE.
+        """
+        if not subject:
+            return "ROUTINE"
+        for filing_type, compiled in self._patterns:
+            if compiled.search(subject):
+                return filing_type
         return "ROUTINE"
 
-    subject_lower = subject.lower()
 
-    for filing_type, pattern in PATTERNS:
-        if re.search(pattern, subject_lower):
-            logger.debug("Classified as %s: %s", filing_type, subject[:60])
-            return filing_type
-
-    return "ROUTINE"
+_CLASSIFIER = _FilingClassifier()
+classify_filing = _CLASSIFIER.classify
 
 
 def classify_pending_filings(conn: sqlite3.Connection) -> int:

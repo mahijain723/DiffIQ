@@ -1,4 +1,8 @@
-"""DiffIQ configuration — stock watchlist, BSE params, paths."""
+"""DiffIQ configuration — stock watchlist, BSE params, paths.
+
+WARNING: This file is committed to the repo. Do NOT add secrets (API keys,
+passwords, tokens) here. Use .env for sensitive values.
+"""
 
 from pathlib import Path
 

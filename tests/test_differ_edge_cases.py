@@ -1,0 +1,154 @@
+"""Edge-case tests for the section-aligned text differ.
+
+Covers empty sections, identical content, reordered sections,
+and ERROR status exclusion in find_prior_filing.
+"""
+
+from diffiq.differ import (
+    align_sections,
+    diff_section,
+    find_prior_filing,
+)
+from diffiq.schema import init_db
+
+
+class TestAlignSections:
+    """align_sections() edge cases."""
+
+    def test_empty_old_sections(self):
+        """Aligning with no old sections — every new section gets None match."""
+        new = [
+            {"header": "Opinion", "text": "In our opinion...", "section_idx": 0},
+        ]
+        aligned = align_sections(new, [])
+        assert len(aligned) == 1
+        assert aligned[0][0] is new[0]
+        assert aligned[0][1] is None
+
+    def test_empty_new_sections(self):
+        """Aligning with no new sections — returns empty list."""
+        old = [
+            {"header": "Opinion", "text": "Old opinion", "section_idx": 0},
+        ]
+        aligned = align_sections([], old)
+        assert aligned == []
+
+    def test_identical_headers(self):
+        """All headers match — all old sections matched with their new counterparts."""
+        new = [
+            {"header": "Opinion", "text": "New opinion", "section_idx": 0},
+            {"header": "Basis", "text": "New basis", "section_idx": 1},
+            {"header": "Notes", "text": "New notes", "section_idx": 2},
+        ]
+        old = [
+            {"header": "Opinion", "text": "Old opinion", "section_idx": 0},
+            {"header": "Basis", "text": "Old basis", "section_idx": 1},
+            {"header": "Notes", "text": "Old notes", "section_idx": 2},
+        ]
+        aligned = align_sections(new, old)
+        assert len(aligned) == 3
+        assert all(match is not None for _, match in aligned)
+        assert [m["header"] for _, m in aligned] == ["Opinion", "Basis", "Notes"]
+
+    def test_reordered_sections(self):
+        """Sections in different order still align by header content."""
+        new = [
+            {"header": "Notes", "text": "New notes", "section_idx": 0},
+            {"header": "Opinion", "text": "New opinion", "section_idx": 1},
+        ]
+        old = [
+            {"header": "Opinion", "text": "Old opinion", "section_idx": 0},
+            {"header": "Notes", "text": "Old notes", "section_idx": 1},
+        ]
+        aligned = align_sections(new, old)
+        assert len(aligned) == 2
+        # First new section "Notes" should match old "Notes" (header match)
+        assert aligned[0][1] is not None
+        assert aligned[0][1]["header"] == "Notes"
+        assert aligned[1][1] is not None
+        assert aligned[1][1]["header"] == "Opinion"
+
+
+class TestFindPriorFiling:
+    """find_prior_filing() exclusion edge cases."""
+
+    def test_excludes_error_status(self, db):
+        """ERROR status filings are excluded — the valid READY prior is chosen instead."""
+        conn = db
+        conn.execute(
+            "INSERT INTO stocks (id, bse_code, name) VALUES (1, '500295', 'VEDL')"
+        )
+        # Filing 1: READY — valid prior
+        conn.execute(
+            "INSERT INTO filings (id, stock_id, filing_uuid, filing_date, "
+            "subject, pdf_url, status, filing_type) "
+            "VALUES (1, 1, 'u1', '2026-01-01', 'Audit 2025', "
+            "'https://ex.com/1.pdf', 'READY', 'AUDIT_REPORT')"
+        )
+        # Filing 2: ERROR — should be skipped in prior search
+        conn.execute(
+            "INSERT INTO filings (id, stock_id, filing_uuid, filing_date, "
+            "subject, pdf_url, status, filing_type) "
+            "VALUES (2, 1, 'u2', '2026-06-01', 'Audit 2026 (failed)', "
+            "'https://ex.com/2.pdf', 'ERROR_EXTRACTION', 'AUDIT_REPORT')"
+        )
+        # Filing 3: current filing (id to exclude from prior search)
+        conn.execute(
+            "INSERT INTO filings (id, stock_id, filing_uuid, filing_date, "
+            "subject, pdf_url, status, filing_type) "
+            "VALUES (3, 1, 'u3', '2026-06-15', 'Audit 2026', "
+            "'https://ex.com/3.pdf', 'READY', 'AUDIT_REPORT')"
+        )
+        conn.commit()
+
+        # Query for prior to filing 3
+        prior = find_prior_filing(conn, 1, "AUDIT_REPORT", 3)
+        assert prior is not None
+        # Should pick filing 1 (READY), not filing 2 (ERROR_EXTRACTION)
+        assert prior["id"] == 1
+
+    def test_excludes_queued_status(self, db):
+        """QUEUED status filings are excluded from being 'prior'."""
+        conn = db
+        conn.execute(
+            "INSERT INTO stocks (id, bse_code, name) VALUES (1, '500295', 'VEDL')"
+        )
+        conn.execute(
+            "INSERT INTO filings (id, stock_id, filing_uuid, filing_date, "
+            "subject, pdf_url, status, filing_type) "
+            "VALUES (1, 1, 'u1', '2026-01-01', 'Audit 2025', "
+            "'https://ex.com/1.pdf', 'QUEUED', 'AUDIT_REPORT')"
+        )
+        conn.commit()
+
+        # Only filing is QUEUED — should return None
+        prior = find_prior_filing(conn, 1, "AUDIT_REPORT", 1)
+        assert prior is None
+
+
+class TestDiffSection:
+    """diff_section() edge cases."""
+
+    def test_near_identical_text_under_threshold(self):
+        """Texts with a tiny change produce diff output under 100 chars → changed=False."""
+        old_text = "Price: 100"
+        new_text = "Price: 101"
+        diff_text, changed = diff_section(new_text, old_text)
+        # diff output headers (--- previous\n+++ current\n@@ -1 +1 @@\n) +
+        # one changed line is ~70 chars — under 100
+        assert changed is False, (
+            f"Expected changed=False for tiny edit, "
+            f"got diff_text length={len(diff_text)}"
+        )
+
+    def test_large_diff_over_threshold(self):
+        """Substantially different texts should have changed=True."""
+        old_text = "Short old text."
+        new_text = (
+            "This is a substantially longer new text that should produce "
+            "a diff output that exceeds one hundred characters in total, "
+            "thus triggering the changed flag to be set to True."
+        )
+        diff_text, changed = diff_section(new_text, old_text)
+        assert changed is True
+        assert len(diff_text) > 100

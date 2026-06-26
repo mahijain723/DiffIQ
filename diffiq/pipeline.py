@@ -1,6 +1,8 @@
 """P1 pipeline — crawl BSE, download PDFs, extract text, classify, sectionize, diff."""
 
+import sqlite3
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from time import sleep
 
@@ -23,7 +25,51 @@ from diffiq.schema import init_db
 logger = logging.getLogger(__name__)
 
 
-def run_daily_pipeline() -> None:
+def _process_pdf_result(
+    conn: sqlite3.Connection,
+    entry: dict,
+    filing_id: int,
+    stock_id: int,
+    result,
+) -> bool:
+    """Process the result of a PDF download/extraction for a single filing.
+
+    Args:
+        conn: SQLite connection.
+        entry: BSE manifest entry dict.
+        filing_id: DB filing ID.
+        stock_id: DB stock ID (used for diff queries).
+        result: ExtractionResult from download_pdf_text.
+
+    Returns:
+        True if successful (READY), False if error.
+    """
+    if result.text:
+        update_filing_raw_text(conn, filing_id, result.text)
+        update_filing_status(conn, filing_id, "READY")
+        logger.info("    Extracted %d chars → READY", len(result.text))
+
+        ft = entry.get("filing_type")
+        if not ft:
+            ft = classify_filing(entry.get("subject", ""))
+            update_filing_type(conn, filing_id, ft)
+
+        extract_and_store_sections(conn, filing_id, result.text, ft)
+        run_diffs_for_filing(conn, filing_id, stock_id, ft)
+        return True
+    else:
+        error_msg = result.error or "Unknown extraction error"
+        update_filing_status(conn, filing_id, "ERROR_EXTRACTION", error_msg)
+        logger.info("    Extraction failed → ERROR_EXTRACTION: %s", error_msg)
+        return False
+
+
+_PDF_WORKERS = 3
+
+
+def run_daily_pipeline(
+    conn: sqlite3.Connection | None = None,
+) -> None:
     """P0 daily pipeline: crawl BSE announcements, download PDFs, extract, store.
 
     For each stock in the watchlist:
@@ -31,13 +77,20 @@ def run_daily_pipeline() -> None:
         2. Insert new announcements (QUEUED status).
         3. Download and extract text from filings with PDF URLs.
         4. Update status to READY or ERROR_*.
+
+    Args:
+        conn: Optional SQLite connection. If None, opens and manages its own
+              connection via init_db(DB_PATH). Pass a connection for testing
+              (e.g. :memory:) — caller owns lifecycle and must close it.
     """
+    managed: bool = conn is None
     logger.info("=== DiffIQ P0 Pipeline Start ===")
 
     # Ensure data directories exist
     PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    conn = init_db(DB_PATH)
+    if managed:
+        conn = init_db(DB_PATH)
 
     total_new: int = 0
     total_errors: int = 0
@@ -66,13 +119,14 @@ def run_daily_pipeline() -> None:
             continue
 
         new_count: int = 0
+        pdf_entries: list[tuple[dict, int]] = []
+
+        # First pass: insert new filings, classify, identify PDF-enabled ones
         for entry in manifest:
-            # Skip if already in DB
             existing = get_filing_by_uuid(conn, entry["filing_uuid"])
             if existing:
                 continue
 
-            # Insert new filing
             filing_id = insert_filing(
                 conn,
                 stock_id,
@@ -89,11 +143,9 @@ def run_daily_pipeline() -> None:
             )
             new_count += 1
 
-            # Set filing type from BSE's newstype
             if entry.get("filing_type"):
                 update_filing_type(conn, filing_id, entry["filing_type"])
 
-            # Download and extract text (skip if no PDF URL)
             if not entry.get("pdf_url"):
                 update_filing_status(
                     conn, filing_id, "NO_PDF", "No attachment available"
@@ -102,49 +154,32 @@ def run_daily_pipeline() -> None:
                 continue
 
             update_filing_status(conn, filing_id, "DOWNLOADING")
-            result = download_pdf_text(entry["pdf_url"])
+            pdf_entries.append((entry, filing_id))
 
-            if result.text:
-                update_filing_raw_text(conn, filing_id, result.text)
-                update_filing_status(conn, filing_id, "READY")
-                logger.info(
-                    "    Extracted %d chars → READY", len(result.text)
-                )
-
-                # P1: classify → sectionize → diff
-                ft = entry.get("filing_type")
-                if not ft:
-                    ft = classify_filing(entry.get("subject", ""))
-                    update_filing_type(conn, filing_id, ft)
-
-                extract_and_store_sections(
-                    conn, filing_id, result.text, ft
-                )
-                run_diffs_for_filing(conn, filing_id, stock_id, ft)
-
-                conn.commit()
-            else:
-                error_msg = result.error or "Unknown extraction error"
-                update_filing_status(
-                    conn,
-                    filing_id,
-                    "ERROR_EXTRACTION",
-                    error_msg,
-                )
-                conn.commit()
-                logger.info(
-                    "    Extraction failed → ERROR_EXTRACTION: %s",
-                    error_msg,
-                )
-                total_errors += 1
+        # Second pass: download PDFs in parallel, process results sequentially
+        if pdf_entries:
+            conn.commit()
+            with ThreadPoolExecutor(max_workers=_PDF_WORKERS) as pool:
+                future_map = {
+                    pool.submit(download_pdf_text, en["pdf_url"]): (en, fid)
+                    for en, fid in pdf_entries
+                }
+                for future in as_completed(future_map):
+                    entry, filing_id = future_map[future]
+                    result = future.result()
+                    ok = _process_pdf_result(conn, entry, filing_id, stock_id, result)
+                    if not ok:
+                        total_errors += 1
+                    conn.commit()
 
         total_new += new_count
         if manifest:
             sleep(CRAWL_DELAY_SECONDS)
 
-    conn.close()
+    if managed:
+        conn.close()
     logger.info(
-        "=== Pipeline complete: %d new filings, %d errors ===",
+        "=== Pipeline complete: %d new filings, %d errors ===\n",
         total_new,
         total_errors,
     )
@@ -158,9 +193,19 @@ def run_backlog() -> None:
     conn.close()
 
 
-def sync() -> None:
-    """Backfill all existing READY filings through classify → sectionize → differ."""
-    conn = init_db(DB_PATH)
+def sync(
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Backfill all existing READY filings through classify → sectionize → differ.
+
+    Args:
+        conn: Optional SQLite connection. If None, opens and manages its own
+              connection via init_db(DB_PATH). Pass a connection for testing
+              (e.g. :memory:) — caller owns lifecycle and must close it.
+    """
+    managed: bool = conn is None
+    if managed:
+        conn = init_db(DB_PATH)
 
     rows = conn.execute(
         "SELECT id, stock_id, subject, raw_text, filing_type FROM filings WHERE status = 'READY'"
@@ -168,7 +213,8 @@ def sync() -> None:
 
     if not rows:
         logger.info("No READY filings to sync")
-        conn.close()
+        if managed:
+            conn.close()
         return
 
     logger.info("Syncing %d READY filings", len(rows))
@@ -196,7 +242,8 @@ def sync() -> None:
         run_diffs_for_filing(conn, filing_id, stock_id, filing_type)
 
     conn.commit()
-    conn.close()
+    if managed:
+        conn.close()
     logger.info("Sync complete")
 
 

@@ -54,6 +54,11 @@ def download_pdf_text(pdf_url: str) -> ExtractionResult:
                 headers={"User-Agent": USER_AGENT},
             )
             resp.raise_for_status()
+        # Reject oversized responses (>50MB) to prevent OOM
+        content_length = resp.headers.get("content-length")
+        if content_length and int(content_length) > 50 * 1024 * 1024:
+            logger.warning("PDF too large: %s — %s bytes", pdf_url, content_length)
+            return ExtractionResult(text=None, error="PDF too large (content-length > 50MB)")
     except httpx.HTTPError as e:
         logger.warning("PDF download failed: %s — %s", pdf_url, e)
         return ExtractionResult(text=None, error=f"Download failed: {e}")
@@ -70,6 +75,10 @@ def download_pdf_text(pdf_url: str) -> ExtractionResult:
         return ExtractionResult(text=None, error=f"Corrupted PDF: {e}")
 
     full_text: str = "\n".join(pages)
+
+    if len(full_text) > 1_000_000:
+        full_text = full_text[:1_000_000]
+        logger.info("Truncated extracted text to 1MB for %s", pdf_url)
 
     if len(full_text) < 100:
         logger.info(

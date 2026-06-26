@@ -6,6 +6,7 @@ from pathlib import Path
 SCHEMA_SQL: str = """
 PRAGMA journal_mode=WAL;
 PRAGMA cache_size=-64000;
+PRAGMA busy_timeout=5000;
 
 CREATE TABLE IF NOT EXISTS stocks (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,6 +42,9 @@ CREATE TABLE IF NOT EXISTS sections (
     page_num    INTEGER,
     section_idx INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_sections_filing_id
+    ON sections(filing_id);
 
 CREATE TABLE IF NOT EXISTS diffs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

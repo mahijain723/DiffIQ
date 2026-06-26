@@ -105,7 +105,9 @@ def get_last_filing_of_type(
     """Most recent filing of a given type for a stock (excludes current)."""
     row = conn.execute(
         """SELECT * FROM filings
-           WHERE stock_id = ? AND filing_type = ? AND status NOT IN ('QUEUED', 'ERROR_%')
+           WHERE stock_id = ? AND filing_type = ?
+             AND status NOT IN ('QUEUED')
+             AND status NOT LIKE 'ERROR_%'
            ORDER BY filing_date DESC, created_at DESC
            LIMIT 1""",
         (stock_id, filing_type),
@@ -143,6 +145,40 @@ def get_sections(
     return [dict(r) for r in rows]
 
 
+def get_sections_for_filings(
+    conn: sqlite3.Connection, filing_ids: list[int]
+) -> dict[int, list[dict[str, Any]]]:
+    """Fetch all sections for multiple filings in one query.
+
+    Args:
+        conn: SQLite connection.
+        filing_ids: List of filing IDs to fetch sections for (max 500).
+
+    Returns:
+        Dict mapping each filing_id to its list of section dicts.
+        Filings with no sections are absent from the dict.
+
+    Raises:
+        ValueError: If filing_ids exceeds 500 entries.
+    """
+    if not filing_ids:
+        return {}
+    if len(filing_ids) > 500:
+        raise ValueError(
+            f"filing_ids too large: {len(filing_ids)} (max 500)"
+        )
+    placeholders = ",".join("?" * len(filing_ids))
+    rows = conn.execute(
+        f"SELECT * FROM sections WHERE filing_id IN ({placeholders}) ORDER BY filing_id, section_idx",
+        filing_ids,
+    ).fetchall()
+    result: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        d = dict(row)
+        result.setdefault(d["filing_id"], []).append(d)
+    return result
+
+
 def insert_diff(conn: sqlite3.Connection, diff_data: dict) -> int:
     """Insert a diff record. Returns diff id."""
     cur = conn.execute(
@@ -178,6 +214,43 @@ def get_diffs_for_filing(
         (stock_id, filing_id),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_diffs_for_filings(
+    conn: sqlite3.Connection, filing_ids: list[int], stock_id: int
+) -> dict[int, list[dict[str, Any]]]:
+    """Fetch all diffs for multiple filings in one query.
+
+    Args:
+        conn: SQLite connection.
+        filing_ids: List of filing IDs to fetch diffs for (max 500).
+        stock_id: Stock ID to filter by.
+
+    Returns:
+        Dict mapping each filing_id_new to its list of diff dicts.
+        Filings with no diffs are absent from the dict.
+
+    Raises:
+        ValueError: If filing_ids exceeds 500 entries.
+    """
+    if not filing_ids:
+        return {}
+    if len(filing_ids) > 500:
+        raise ValueError(
+            f"filing_ids too large: {len(filing_ids)} (max 500)"
+        )
+    placeholders = ",".join("?" * len(filing_ids))
+    rows = conn.execute(
+        f"""SELECT * FROM diffs
+           WHERE stock_id = ? AND filing_id_new IN ({placeholders})
+           ORDER BY filing_id_new, created_at DESC""",
+        [stock_id, *filing_ids],
+    ).fetchall()
+    result: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        d = dict(row)
+        result.setdefault(d["filing_id_new"], []).append(d)
+    return result
 
 
 def get_portfolio_summary(
