@@ -137,135 +137,7 @@ else:
 st.divider()
 
 # ══════════════════════════════════════════════════════════════════
-# Stock Selector (from DB — STOCKS config is seed only)
-# ══════════════════════════════════════════════════════════════════
-all_stocks = db.get_all_stocks(get_connection())
-if not all_stocks:
-    st.info("Watchlist is empty. Add stocks using the Manage Watchlist section below.")
-    st.stop()
-
-stock_names = [s["name"] for s in all_stocks]
-selected_stock = st.selectbox("Select Stock", stock_names, index=0)
-stock_data = next(s for s in all_stocks if s["name"] == selected_stock)
-bse_code = stock_data["bse_code"]
-st.caption(f"BSE Code: {bse_code}")
-
-with st.spinner("Loading filings..."):
-    filings = _get_cached_filings(bse_code)
-
-# ══════════════════════════════════════════════════════════════════
-# Filing Summary Metrics
-# ══════════════════════════════════════════════════════════════════
-if filings:
-    total = len(filings)
-    ready_count = sum(1 for f in filings if f["status"] == "READY")
-    error_count = sum(1 for f in filings if f["status"].startswith("ERROR"))
-    pending_count = sum(1 for f in filings if f["status"] == "QUEUED")
-
-    cols = st.columns(4)
-    cols[0].metric("Total Filings", total)
-    cols[1].metric("Ready", ready_count)
-    cols[2].metric("Pending", pending_count)
-    cols[3].metric("Errors", error_count)
-else:
-    st.info(
-        "No filings yet. Run the pipeline first:\n\n"
-        "`python -m diffiq.pipeline`"
-    )
-
-st.divider()
-
-# ══════════════════════════════════════════════════════════════════
-# Filing Expanders — with batch section/diff queries
-# ══════════════════════════════════════════════════════════════════
-if filings:
-    conn = get_connection()
-    stock_row = db.get_stock_by_bse_code(conn, bse_code)
-    stock_id = stock_row["id"] if stock_row else None
-
-    # Batch-fetch sections and diffs for all READY filings at once
-    ready_ids = [f["id"] for f in filings if f["status"] == "READY"]
-    all_sections = db.get_sections_for_filings(conn, ready_ids) if ready_ids else {}
-    all_diffs = (
-        db.get_diffs_for_filings(conn, ready_ids, stock_id)
-        if ready_ids and stock_id
-        else {}
-    )
-
-    for f in filings:
-        fid = f["id"]
-        subject = f.get("subject", "") or ""
-        status = f["status"]
-
-        with st.expander(
-            f"{f['filing_date']} | {subject[:72]}"
-            f"{'...' if len(subject) > 72 else ''}",
-            expanded=False,
-        ):
-            # Filing metadata row
-            meta = st.columns([1.2, 1.2, 1, 0.8])
-            meta[0].markdown(f"**Type:** {f.get('filing_type') or '-'}")
-            meta[1].markdown(
-                f"**Status:** {status_badge_html(status)}",
-                unsafe_allow_html=True,
-            )
-            meta[2].markdown(f"**ID:** {fid}")
-            meta[3].markdown(f"[PDF]({f.get('pdf_url', '')})")
-
-            if f.get("error"):
-                st.error(f"Error: {f['error']}")
-
-            # Sections with diffs (uses pre-fetched batch data)
-            if status == "READY":
-                sections = all_sections.get(fid, [])
-                if sections:
-                    st.markdown(f"**Sections ({len(sections)})**")
-
-                    diffs_by_header: dict = {}
-                    if stock_id and fid in all_diffs:
-                        for d in all_diffs[fid]:
-                            diffs_by_header[d["section_header"]] = d
-
-                    for sec in sections:
-                        header = sec["header"]
-                        sec_text = sec.get("text", "")
-                        has_diff = (
-                            header in diffs_by_header
-                            and diffs_by_header[header].get("changed")
-                        )
-
-                        with st.expander(
-                            f"**{header}**",
-                            expanded=bool(has_diff),
-                        ):
-                            if has_diff:
-                                st.markdown(
-                                    '<span class="diff-badge">'
-                                    '<svg xmlns="http://www.w3.org/2000/svg" '
-                                    'width="12" height="12" viewBox="0 0 24 24" '
-                                    'fill="none" stroke="currentColor" '
-                                    'stroke-width="2" stroke-linecap="round" '
-                                    'stroke-linejoin="round">'
-                                    '<path d="M12 3v18"/>'
-                                    '<path d="M9 6l3-3 3 3"/>'
-                                    '<path d="M9 18l3 3 3-3"/>'
-                                    "</svg> Changed</span>",
-                                    unsafe_allow_html=True,
-                                )
-
-                            preview = sec_text[:500]
-                            st.text(preview + ("..." if len(sec_text) > 500 else ""))
-
-                            if has_diff:
-                                st.code(
-                                    diffs_by_header[header].get("diff_text", "")[:2000],
-                                    language="diff",
-                                )
-
-st.divider()
-
-# ══════════════════════════════════════════════════════════════════
-# Watchlist Management
+# Watchlist Management (always visible — even when watchlist empty)
 # ══════════════════════════════════════════════════════════════════
 st.subheader("Watchlist Management", divider=True)
 
@@ -306,6 +178,131 @@ with col2:
                 st.rerun()
     else:
         st.write("No stocks in watchlist.")
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════════════
+# Stock Selector (from DB — STOCKS config is seed only)
+# ══════════════════════════════════════════════════════════════════
+all_stocks = db.get_all_stocks(get_connection())
+
+if not all_stocks:
+    st.info("Watchlist is empty. Add stocks using the section above.")
+else:
+    stock_names = [s["name"] for s in all_stocks]
+    selected_stock = st.selectbox("Select Stock", stock_names, index=0)
+    stock_data = next(s for s in all_stocks if s["name"] == selected_stock)
+    bse_code = stock_data["bse_code"]
+    st.caption(f"BSE Code: {bse_code}")
+
+    with st.spinner("Loading filings..."):
+        filings = _get_cached_filings(bse_code)
+
+    # ══════════════════════════════════════════════════════════════════
+    # Filing Summary Metrics
+    # ══════════════════════════════════════════════════════════════════
+    if filings:
+        total = len(filings)
+        ready_count = sum(1 for f in filings if f["status"] == "READY")
+        error_count = sum(1 for f in filings if f["status"].startswith("ERROR"))
+        pending_count = sum(1 for f in filings if f["status"] == "QUEUED")
+
+        cols = st.columns(4)
+        cols[0].metric("Total Filings", total)
+        cols[1].metric("Ready", ready_count)
+        cols[2].metric("Pending", pending_count)
+        cols[3].metric("Errors", error_count)
+    else:
+        st.info(
+            "No filings yet. Run the pipeline first:\n\n"
+            "`python -m diffiq.pipeline`"
+        )
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════════
+    # Filing Expanders — with batch section/diff queries
+    # ══════════════════════════════════════════════════════════════════
+    if filings:
+        conn = get_connection()
+        stock_row = db.get_stock_by_bse_code(conn, bse_code)
+        stock_id = stock_row["id"] if stock_row else None
+
+        ready_ids = [f["id"] for f in filings if f["status"] == "READY"]
+        all_sections = db.get_sections_for_filings(conn, ready_ids) if ready_ids else {}
+        all_diffs = (
+            db.get_diffs_for_filings(conn, ready_ids, stock_id)
+            if ready_ids and stock_id
+            else {}
+        )
+
+        for f in filings:
+            fid = f["id"]
+            subject = f.get("subject", "") or ""
+            status = f["status"]
+
+            with st.expander(
+                f"{f['filing_date']} | {subject[:72]}"
+                f"{'...' if len(subject) > 72 else ''}",
+                expanded=False,
+            ):
+                meta = st.columns([1.2, 1.2, 1, 0.8])
+                meta[0].markdown(f"**Type:** {f.get('filing_type') or '-'}")
+                meta[1].markdown(
+                    f"**Status:** {status_badge_html(status)}",
+                    unsafe_allow_html=True,
+                )
+                meta[2].markdown(f"**ID:** {fid}")
+                meta[3].markdown(f"[PDF]({f.get('pdf_url', '')})")
+
+                if f.get("error"):
+                    st.error(f"Error: {f['error']}")
+
+                if status == "READY":
+                    sections = all_sections.get(fid, [])
+                    if sections:
+                        st.markdown(f"**Sections ({len(sections)})**")
+
+                        diffs_by_header: dict = {}
+                        if stock_id and fid in all_diffs:
+                            for d in all_diffs[fid]:
+                                diffs_by_header[d["section_header"]] = d
+
+                        for sec in sections:
+                            header = sec["header"]
+                            sec_text = sec.get("text", "")
+                            has_diff = (
+                                header in diffs_by_header
+                                and diffs_by_header[header].get("changed")
+                            )
+
+                            with st.expander(
+                                f"**{header}**",
+                                expanded=bool(has_diff),
+                            ):
+                                if has_diff:
+                                    st.markdown(
+                                        '<span class="diff-badge">'
+                                        '<svg xmlns="http://www.w3.org/2000/svg" '
+                                        'width="12" height="12" viewBox="0 0 24 24" '
+                                        'fill="none" stroke="currentColor" '
+                                        'stroke-width="2" stroke-linecap="round" '
+                                        'stroke-linejoin="round">'
+                                        '<path d="M12 3v18"/>'
+                                        '<path d="M9 6l3-3 3 3"/>'
+                                        '<path d="M9 18l3 3 3-3"/>'
+                                        "</svg> Changed</span>",
+                                        unsafe_allow_html=True,
+                                    )
+
+                                preview = sec_text[:500]
+                                st.text(preview + ("..." if len(sec_text) > 500 else ""))
+
+                                if has_diff:
+                                    st.code(
+                                        diffs_by_header[header].get("diff_text", "")[:2000],
+                                        language="diff",
+                                    )
 
 st.caption(
     "Data source: BSE Corporate Announcements API. "
