@@ -189,16 +189,29 @@ class TestPipelineFlow:
 class TestBacklogFlow:
     """run_backlog() with mocked external dependencies."""
 
-    def test_backlog_empty(self) -> None:
+    @patch("diffiq.pipeline.DB_PATH")
+    def test_backlog_empty(self, mock_db_path) -> None:
         """run_backlog handles no pending filings gracefully."""
+        import tempfile, os
         from diffiq.pipeline import run_backlog
-        # Empty DB — should not raise
+        db_path = tempfile.mktemp(suffix=".db")
+        mock_db_path.__str__.return_value = db_path
+        mock_db_path.__fspath__.return_value = db_path
+        conn = init_db(db_path)
+        conn.close()
         run_backlog()
+        os.unlink(db_path)
 
     @patch("diffiq.pipeline.download_pdf_text")
-    def test_backlog_no_pdf_url(self, mock_download) -> None:
+    @patch("diffiq.pipeline.DB_PATH")
+    def test_backlog_no_pdf_url(self, mock_db_path, mock_download) -> None:
         """run_backlog skips filings without a PDF URL."""
-        conn = init_db(":memory:")
+        import tempfile, os
+        db_path = tempfile.mktemp(suffix=".db")
+        mock_db_path.__str__.return_value = db_path
+        mock_db_path.__fspath__.return_value = db_path
+
+        conn = init_db(db_path)
         stock_id = upsert_stock(conn, "500295", "VEDL")
         fid = insert_filing(
             conn, stock_id, "bl-uuid", "2026-07-01",
