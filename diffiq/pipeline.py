@@ -17,7 +17,7 @@ from diffiq.db import (
     upsert_stock,
 )
 from diffiq.differ import run_diffs_for_filing
-from diffiq.extractor import extract_and_store_sections, download_pdf_text
+from diffiq.extractor import ExtractionResult, extract_and_store_sections, download_pdf_text
 from diffiq.schema import init_db
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ def _process_pdf_result(
     entry: dict,
     filing_id: int,
     stock_id: int,
-    result,
+    result: ExtractionResult,
 ) -> bool:
     """Process the result of a PDF download/extraction for a single filing.
 
