@@ -3,6 +3,8 @@
 import pytest
 from diffiq.schema import init_db
 from diffiq.db import (
+    add_stock,
+    get_all_stocks,
     get_diffs_for_stock,
     get_filing_by_uuid,
     get_filings_for_stock,
@@ -13,6 +15,7 @@ from diffiq.db import (
     insert_diff,
     insert_filing,
     insert_sections,
+    remove_stock,
     update_filing_raw_text,
     update_filing_status,
     update_filing_type,
@@ -191,3 +194,75 @@ class TestDiffs:
         assert len(diffs) == 1
         assert diffs[0]["section_header"] == "Auditor's Report"
         assert diffs[0]["changed"] == 1
+
+
+class TestAddStock:
+    def test_inserts_new_stock(self, conn) -> None:
+        """add_stock creates a new stock and returns its ID."""
+        stock_id = add_stock(conn, "500295", "VEDL")
+        assert stock_id > 0
+        row = get_stock_by_bse_code(conn, "500295")
+        assert row is not None
+        assert row["name"] == "VEDL"
+        assert row["active"] == 1
+
+    def test_reactivates_deactivated_stock(self, conn) -> None:
+        """add_stock reactivates a stock that was previously removed."""
+        stock_id = add_stock(conn, "500295", "VEDL")
+        remove_stock(conn, stock_id)
+        conn.commit()
+
+        new_id = add_stock(conn, "500295", "VEDLTD")
+        assert new_id == stock_id  # Same ID, not a duplicate
+        row = get_stock_by_bse_code(conn, "500295")
+        assert row["name"] == "VEDLTD"
+        assert row["active"] == 1
+
+
+class TestRemoveStock:
+    def test_soft_deletes_stock(self, conn) -> None:
+        """remove_stock sets active=0 without deleting the row."""
+        stock_id = add_stock(conn, "500295", "VEDL")
+        remove_stock(conn, stock_id)
+        conn.commit()
+
+        all_stocks = get_all_stocks(conn)
+        assert all(s["id"] != stock_id for s in all_stocks)
+
+        row = get_stock_by_bse_code(conn, "500295")
+        assert row is not None
+        assert row["active"] == 0
+
+
+class TestGetAllStocks:
+    def test_excludes_deactivated(self, conn) -> None:
+        """Deactivated stocks are not returned."""
+        s1 = add_stock(conn, "500295", "VEDL")
+        add_stock(conn, "500180", "HDFCBANK")
+        remove_stock(conn, s1)
+        conn.commit()
+
+        stocks = get_all_stocks(conn)
+        assert len(stocks) == 1
+        assert stocks[0]["bse_code"] == "500180"
+
+    def test_excludes_empty_bse_code(self, conn) -> None:
+        """ETFs with empty bse_code are excluded."""
+        add_stock(conn, "500295", "VEDL")
+        add_stock(conn, "", "NIFTYBEES")
+        conn.commit()
+
+        stocks = get_all_stocks(conn)
+        assert len(stocks) == 1
+        assert stocks[0]["name"] == "VEDL"
+
+    def test_ordered_by_name(self, conn) -> None:
+        """Results are sorted alphabetically by stock name."""
+        add_stock(conn, "500295", "VEDL")
+        add_stock(conn, "500180", "HDFCBANK")
+        add_stock(conn, "532174", "ICICIBANK")
+        conn.commit()
+
+        stocks = get_all_stocks(conn)
+        names = [s["name"] for s in stocks]
+        assert names == sorted(names)
